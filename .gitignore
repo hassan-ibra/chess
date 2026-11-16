@@ -1,0 +1,4 @@
+node_modules
+dist
+public/stockfish-19-lite-single.js
+public/stockfish-19-lite-single.wasm
