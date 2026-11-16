@@ -21,13 +21,19 @@ type PendingSearch = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type QueuedSearch = {
+  fen: string;
+  difficulty: DifficultyName;
+  resolve: (result: SearchResult) => void;
+};
+
 export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): EngineClient {
   let generation = 0;
   let readySettled = false;
   let announced = false;
-  let ignoreNextBestmove = false;
+  let staleBestmoves = 0;
   let pending: PendingSearch | null = null;
-  const queued: { fen: string; difficulty: DifficultyName; resolve: (result: SearchResult) => void }[] = [];
+  const queued: QueuedSearch[] = [];
   let resolveReady: () => void = () => {};
   let rejectReady: (reason: Event) => void = () => {};
   const ready = new Promise<void>((resolve, reject) => {
@@ -46,14 +52,23 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
     resolve(result);
   }
 
+  function abandonSearch(reason: "stopped" | "timeout") {
+    const active = pending;
+    if (active) {
+      staleBestmoves += 1;
+    }
+    generation += 1;
+    worker.postMessage("stop");
+    if (active) {
+      finish({ ok: false, reason });
+    }
+  }
+
   function onTimeout(id: number) {
     if (!pending || pending.id !== id) {
       return;
     }
-    worker.postMessage("stop");
-    generation += 1;
-    ignoreNextBestmove = true;
-    finish({ ok: false, reason: "timeout" });
+    abandonSearch("timeout");
   }
 
   function rejectQueued(result: SearchResult) {
@@ -64,21 +79,13 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
   }
 
   function stop() {
-    worker.postMessage("stop");
-    generation += 1;
-    if (pending) {
-      ignoreNextBestmove = true;
-      finish({ ok: false, reason: "stopped" });
-    }
+    abandonSearch("stopped");
     rejectQueued({ ok: false, reason: "stopped" });
   }
 
   function startSearch(fen: string, difficulty: DifficultyName): Promise<SearchResult> {
     if (pending) {
-      worker.postMessage("stop");
-      generation += 1;
-      ignoreNextBestmove = true;
-      finish({ ok: false, reason: "stopped" });
+      abandonSearch("stopped");
     }
     generation += 1;
     const id = generation;
@@ -117,11 +124,15 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
         readySettled = true;
         resolveReady();
         flushQueued();
-      } else if (text.startsWith("bestmove") && ignoreNextBestmove) {
-        ignoreNextBestmove = false;
-      } else if (text.startsWith("bestmove") && pending && pending.id === generation) {
-        const move = parseBestMove(text);
-        finish(move ? { ok: true, move } : { ok: false, reason: "unparsed" });
+      } else if (text.startsWith("bestmove")) {
+        if (staleBestmoves > 0) {
+          staleBestmoves -= 1;
+          continue;
+        }
+        if (pending && pending.id === generation) {
+          const move = parseBestMove(text);
+          finish(move ? { ok: true, move } : { ok: false, reason: "unparsed" });
+        }
       }
     }
   }
