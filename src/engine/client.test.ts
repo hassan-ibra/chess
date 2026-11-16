@@ -137,4 +137,60 @@ describe("createEngineClient", () => {
     worker.fail();
     await expect(pending).resolves.toEqual({ ok: false, reason: "error" });
   });
+
+  it("stops a superseded search and ignores its bestmove", async () => {
+    const { client, worker } = await readyClient();
+    const first = client.search(fen, "easy");
+    const before = worker.sent.length;
+    const second = client.search(fen, "medium");
+
+    await expect(first).resolves.toEqual({ ok: false, reason: "stopped" });
+    const added = worker.sent.slice(before);
+    const stopAt = added.indexOf("stop");
+    const goAt = added.indexOf("go movetime 250");
+    expect(stopAt).toBeGreaterThanOrEqual(0);
+    expect(goAt).toBeGreaterThan(stopAt);
+
+    worker.emit("bestmove e2e4");
+    let settled = false;
+    void second.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    worker.emit("bestmove d2d4");
+    await expect(second).resolves.toEqual({ ok: true, move: { from: "d2", to: "d4" } });
+  });
+
+  it("does not send a search until the engine is ready", async () => {
+    const worker = fakeWorker();
+    const client = createEngineClient(worker);
+    const pending = client.search(fen, "easy");
+
+    worker.emit("uciok");
+    expect(worker.sent.some((line) => line.startsWith("position fen") || line.startsWith("go "))).toBe(false);
+
+    worker.emit("readyok");
+    await client.ready;
+    expect(worker.sent).toContain(`position fen ${fen}`);
+    expect(worker.sent).toContain("go depth 2");
+    worker.emit("bestmove e2e4");
+    await expect(pending).resolves.toEqual({ ok: true, move: { from: "e2", to: "e4" } });
+  });
+
+  it("fails a search when the engine errors before it is ready", async () => {
+    const worker = fakeWorker();
+    const client = createEngineClient(worker);
+    const pending = client.search(fen, "easy");
+    worker.fail();
+    const result = await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        setTimeout(() => resolve("still-pending"), 50);
+      }),
+    ]);
+    expect(result).toEqual({ ok: false, reason: "error" });
+    expect(worker.sent.some((line) => line.startsWith("position fen") || line.startsWith("go "))).toBe(false);
+  });
 });

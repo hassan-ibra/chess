@@ -25,13 +25,16 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
   let generation = 0;
   let readySettled = false;
   let announced = false;
+  let ignoreNextBestmove = false;
   let pending: PendingSearch | null = null;
+  const queued: { fen: string; difficulty: DifficultyName; resolve: (result: SearchResult) => void }[] = [];
   let resolveReady: () => void = () => {};
   let rejectReady: (reason: Event) => void = () => {};
   const ready = new Promise<void>((resolve, reject) => {
     resolveReady = resolve;
     rejectReady = reject;
   });
+  void ready.catch(() => {});
 
   function finish(result: SearchResult) {
     if (!pending) {
@@ -49,14 +52,53 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
     }
     worker.postMessage("stop");
     generation += 1;
+    ignoreNextBestmove = true;
     finish({ ok: false, reason: "timeout" });
+  }
+
+  function rejectQueued(result: SearchResult) {
+    const jobs = queued.splice(0);
+    for (const job of jobs) {
+      job.resolve(result);
+    }
   }
 
   function stop() {
     worker.postMessage("stop");
     generation += 1;
     if (pending) {
+      ignoreNextBestmove = true;
       finish({ ok: false, reason: "stopped" });
+    }
+    rejectQueued({ ok: false, reason: "stopped" });
+  }
+
+  function startSearch(fen: string, difficulty: DifficultyName): Promise<SearchResult> {
+    if (pending) {
+      worker.postMessage("stop");
+      generation += 1;
+      ignoreNextBestmove = true;
+      finish({ ok: false, reason: "stopped" });
+    }
+    generation += 1;
+    const id = generation;
+    const settings = difficultySettings(difficulty);
+    worker.postMessage(`setoption name Skill Level value ${settings.skill}`);
+    worker.postMessage(`position fen ${fen}`);
+    worker.postMessage(settings.go);
+    return new Promise<SearchResult>((resolve) => {
+      pending = {
+        id,
+        resolve,
+        timer: setTimeout(() => onTimeout(id), timeoutMs),
+      };
+    });
+  }
+
+  function flushQueued() {
+    const jobs = queued.splice(0);
+    for (const job of jobs) {
+      void startSearch(job.fen, job.difficulty).then(job.resolve);
     }
   }
 
@@ -74,6 +116,9 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
       } else if (text === "readyok" && !readySettled) {
         readySettled = true;
         resolveReady();
+        flushQueued();
+      } else if (text.startsWith("bestmove") && ignoreNextBestmove) {
+        ignoreNextBestmove = false;
       } else if (text.startsWith("bestmove") && pending && pending.id === generation) {
         const move = parseBestMove(text);
         finish(move ? { ok: true, move } : { ok: false, reason: "unparsed" });
@@ -85,6 +130,7 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
     if (!readySettled) {
       readySettled = true;
       rejectReady(event);
+      rejectQueued({ ok: false, reason: "error" });
       return;
     }
     if (!pending) {
@@ -106,23 +152,12 @@ export function createEngineClient(worker: EngineWorker, timeoutMs = 5000): Engi
       worker.postMessage("ucinewgame");
     },
     search(fen, difficulty) {
-      if (pending) {
-        generation += 1;
-        finish({ ok: false, reason: "stopped" });
+      if (!readySettled) {
+        return new Promise<SearchResult>((resolve) => {
+          queued.push({ fen, difficulty, resolve });
+        });
       }
-      generation += 1;
-      const id = generation;
-      const settings = difficultySettings(difficulty);
-      worker.postMessage(`setoption name Skill Level value ${settings.skill}`);
-      worker.postMessage(`position fen ${fen}`);
-      worker.postMessage(settings.go);
-      return new Promise<SearchResult>((resolve) => {
-        pending = {
-          id,
-          resolve,
-          timer: setTimeout(() => onTimeout(id), timeoutMs),
-        };
-      });
+      return startSearch(fen, difficulty);
     },
   };
 }

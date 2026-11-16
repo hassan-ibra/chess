@@ -282,8 +282,7 @@ export default function PlayPage() {
                   checked={difficulty === level}
                   onChange={() => setDifficulty(level)}
                 />
-                {level[0]?.toUpperCase()}
-                {level.slice(1)}
+                {level === "easy" ? "Easy" : level === "medium" ? "Medium" : "Hard"}
               </label>
             ))}
           </fieldset>
